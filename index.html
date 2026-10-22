@@ -143,11 +143,12 @@ async function init() {
 
 async function probe(prompt) {
   const enc = await tokenizer(prompt);
-  const ids = enc.input_ids;
-  const n = ids.length;
+  // v3 tokenizer returns Tensors of BigInt, not plain arrays
+  const idData = enc.input_ids.data;
+  const n = idData.length;
   const feeds = {
-    input_ids: new ort.Tensor('int64', BigInt64Array.from(ids.map(BigInt)), [1, n]),
-    attention_mask: new ort.Tensor('int64', BigInt64Array.from({ length: n }, () => 1n), [1, n]),
+    input_ids: new ort.Tensor('int64', BigInt64Array.from(idData), [1, n]),
+    attention_mask: new ort.Tensor('int64', new BigInt64Array(n).fill(1n), [1, n]),
   };
   const out = await session.run(feeds);
   // mean-pool tokens per layer, average 12 layers
