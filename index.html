@@ -101,22 +101,19 @@ async function fetchModel(url, onProgress) {
         } catch (e) { /* caching is best-effort */ }
       })();
       const reader = toMem.getReader();
-      const chunks = [];
+      // pre-allocate single buffer (avoids double-buffering 120MB in chunks)
+      const buf = new Uint8Array(total);
       let received = 0;
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        chunks.push(value);
+        buf.set(value, received);
         received += value.byteLength;
         onProgress('Downloading model… ' + Math.round(received / 1048576) + 'MB / ' +
                    Math.round(total / 1048576) + 'MB' + (attempt > 1 ? ' (try ' + attempt + '/3)' : ''));
       }
       await cachePromise;
       if (received < MODEL_BYTES * 0.9) throw new Error('incomplete download (' + received + ' bytes)');
-      const buf = new Uint8Array(received);
-      let o = 0;
-      for (const c of chunks) { buf.set(c, o); o += c.byteLength; }
-      chunks.length = 0;
       return buf.buffer;
     } catch (e) {
       lastErr = e;
