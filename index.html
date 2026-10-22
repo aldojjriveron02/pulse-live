@@ -66,6 +66,66 @@ import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/o
 import { AutoTokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3';
 
 const MODEL_URL = 'https://aldo-push.aldojjriveron.workers.dev/pulse-model/model.int8.onnx';
+const CACHE_NAME = 'pulse-model-v1';
+const MODEL_BYTES = 126129903;
+
+/* Robust model download: retry on transient failures, streaming progress,
+ * Cache API so one success pays for all future loads. */
+async function fetchModel(url, onProgress) {
+  // 1) try cache first
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const hit = await cache.match(url);
+    if (hit) {
+      onProgress('Loading model from cache…');
+      const buf = await hit.arrayBuffer();
+      if (buf.byteLength > MODEL_BYTES * 0.9) return buf;
+    }
+  } catch (e) { /* cache unavailable — fall through to network */ }
+
+  // 2) network with retries
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const total = parseInt(r.headers.get('content-length') || String(MODEL_BYTES), 10) || MODEL_BYTES;
+      // tee the stream: one branch to cache, one to memory
+      const [toCache, toMem] = r.body.tee();
+      const cachePromise = (async () => {
+        try {
+          const cache = await caches.open(CACHE_NAME);
+          await cache.put(url, new Response(toCache, {
+            headers: { 'content-length': String(total), 'content-type': 'application/octet-stream' },
+          }));
+        } catch (e) { /* caching is best-effort */ }
+      })();
+      const reader = toMem.getReader();
+      const chunks = [];
+      let received = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.byteLength;
+        onProgress('Downloading model… ' + Math.round(received / 1048576) + 'MB / ' +
+                   Math.round(total / 1048576) + 'MB' + (attempt > 1 ? ' (try ' + attempt + '/3)' : ''));
+      }
+      await cachePromise;
+      if (received < MODEL_BYTES * 0.9) throw new Error('incomplete download (' + received + ' bytes)');
+      const buf = new Uint8Array(received);
+      let o = 0;
+      for (const c of chunks) { buf.set(c, o); o += c.byteLength; }
+      chunks.length = 0;
+      return buf.buffer;
+    } catch (e) {
+      lastErr = e;
+      onProgress('Download interrupted (try ' + attempt + '/3) — retrying…');
+      await new Promise(s => setTimeout(s, 2000 * attempt));
+    }
+  }
+  throw lastErr;
+}
 const P = window.PULSE_PROBE;
 const MU = P.mu, SD = P.sd, DIR = P.direction, THR = P.threshold;
 
@@ -131,10 +191,41 @@ ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/di
 
 async function init() {
   $('loadbar').style.display = 'block';
-  status.textContent = 'Loading tokenizer…';
-  tokenizer = await AutoTokenizer.from_pretrained('Xenova/gpt2');
-  status.textContent = 'Downloading model (120MB, one-time)…';
-  session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ['wasm'] });
+  const diag = [];
+  const step = async (name, fn) => {
+    const t0 = performance.now();
+    status.textContent = name + '…';
+    try {
+      const r = await fn();
+      diag.push(name + ' OK ' + Math.round(performance.now() - t0) + 'ms');
+      return r;
+    } catch (e) {
+      const info = 'STEP FAILED: ' + name + '\n' +
+        'error: ' + (e && e.name ? e.name + ': ' : '') + (e && e.message ? e.message : String(e)).slice(0, 300) + '\n' +
+        'ua: ' + navigator.userAgent.slice(0, 120) + '\n' +
+        'mem: ' + (navigator.deviceMemory ? navigator.deviceMemory + 'GB' : 'n/a') +
+        ' cores: ' + (navigator.hardwareConcurrency || 'n/a') + '\n' +
+        'done: ' + diag.join(' | ');
+      throw new Error(info);
+    }
+  };
+  try {
+    tokenizer = await step('Loading tokenizer', () => AutoTokenizer.from_pretrained('Xenova/gpt2'));
+    const modelBuf = await step('Downloading model (120MB, one-time)', () =>
+      fetchModel(MODEL_URL, txt => { status.textContent = txt; }));
+    session = await step('Starting AI engine', () =>
+      ort.InferenceSession.create(modelBuf, {
+        executionProviders: ['wasm'],
+        graphOptimizationLevel: 'disabled',  // lower peak memory on iOS
+      }));
+    await step('Warmup scan', () => probe('Hello world.'));
+  } catch (e) {
+    $('loadbar').style.display = 'none';
+    status.innerHTML = '<pre style="white-space:pre-wrap;font-size:11px;color:#ff8a8a">' +
+      String(e.message || e).replace(/</g, '&lt;') + '</pre>';
+    scanBtn.textContent = 'Load failed';
+    return;
+  }
   $('loadbar').style.display = 'none';
   status.textContent = 'Ready. Type something and hit Scan.';
   scanBtn.disabled = false;
@@ -190,11 +281,7 @@ scanBtn.onclick = async () => {
   scanBtn.disabled = false; scanBtn.textContent = 'Scan';
 };
 
-init().catch(e => {
-  $('loadbar').style.display = 'none';
-  status.textContent = 'Load failed: ' + (e.message || e).toString().slice(0, 160);
-  scanBtn.textContent = 'Load failed';
-});
+init();
 </script>
 </body>
 </html>
