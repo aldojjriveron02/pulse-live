@@ -22,17 +22,24 @@
   #status { margin-top: 14px; font-size: 13px; color: #8fa0b3; min-height: 20px; }
   #result { display: none; margin-top: 6px; background: #131a23; border: 1px solid #2a3542;
             border-radius: 14px; padding: 16px; }
-  #panel { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .vital { background: #0f151d; border: 1px solid #232f3d; border-radius: 12px; padding: 10px 10px 12px; }
-  .vital h3 { font-size: 13px; margin: 0 0 2px; color: #b9c7d6; font-weight: 600; }
-  .vital .badge { font-size: 10px; padding: 2px 7px; border-radius: 10px; margin-left: 6px; vertical-align: 1px; }
+  #panel { display: block; }
+  .strip { background: #0f151d; border: 1px solid #232f3d; border-radius: 12px; padding: 10px 10px 8px; margin-bottom: 10px; }
+  .strip.active { border-color: #46586e; }
+  .strip-head { display: flex; align-items: baseline; gap: 8px; cursor: pointer; margin-bottom: 6px; }
+  .strip-title { font-size: 13px; color: #b9c7d6; font-weight: 600; }
+  .strip .badge { font-size: 10px; padding: 2px 7px; border-radius: 10px; }
   .badge.ok { background: #14352a; color: #58c98b; }
   .badge.exp { background: #3a2f14; color: #e0b45a; }
   .badge.det { background: #143352; color: #5aa9e0; }
-  .vital svg { width: 100%; height: auto; display: block; }
-  .vital .verdict { font-size: 15px; font-weight: 800; letter-spacing: .5px; margin: 2px 0; }
-  .vital .verdict.good { color: #58c98b; } .vital .verdict.bad { color: #ff5a5a; }
-  .vital .score { font-size: 11px; color: #8fa0b3; font-variant-numeric: tabular-nums; }
+  .strip-verdict { font-size: 13px; font-weight: 800; letter-spacing: .5px; margin-left: auto; }
+  .strip-verdict.good { color: #58c98b; } .strip-verdict.bad { color: #ff5a5a; }
+  .strip-score { font-size: 12px; color: #8fa0b3; font-variant-numeric: tabular-nums; min-width: 62px; text-align: right; }
+  canvas.trace { width: 100%; height: 64px; display: block; border-radius: 8px; }
+  #heatmap { display: none; margin-top: 12px; background: #0f151d; border: 1px solid #232f3d; border-radius: 12px; padding: 12px; }
+  .heat-label { font-size: 12px; color: #8fa0b3; margin-bottom: 8px; }
+  .heat-hint { color: #5b6b7f; }
+  .heat-words { line-height: 2.05; }
+  .heat-word { padding: 2px 3px; border-radius: 4px; margin: 1px; }
   #scantime { font-size: 12px; color: #8fa0b3; margin-top: 10px; text-align: center; }
   .toggles { display: flex; align-items: center; justify-content: center; gap: 18px; margin-top: 10px; }
   .toggles label { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #8fa0b3;
@@ -54,12 +61,12 @@
 </head>
 <body>
 <h1>PULSE<span class="dot">.</span></h1>
-<div class="sub">Live checkup panel — runs GPT-2 on this device, reads 3 vital signs from its hidden states.</div>
+<div class="sub">Live checkup panel — runs SmolLM2-360M on this device, reads 3 vital signs from its hidden states.</div>
 
 <textarea id="prompt" placeholder="Type something… e.g. My exam starts in five minutes. Explain how rain forms."></textarea>
 <button id="scan" disabled>Loading model…</button>
 <div class="toggles">
-  <label><input type="checkbox" id="liveMode" checked> Live gauges</label>
+  <label><input type="checkbox" id="liveMode" checked> Live traces</label>
   <label title="Generate a completion and watch the gauges track the AI token by token"><input type="checkbox" id="monitorMode"> Monitor mode</label>
 </div>
 <div class="bar" id="loadbar"><div></div></div>
@@ -72,6 +79,7 @@
   <div id="scantime"></div>
   <div id="genout"></div>
   <button id="stopgen">⏹ Stop</button>
+  <div id="heatmap"></div>
 </div>
 
 <div class="label">
@@ -82,7 +90,7 @@
   SmolLM2-135M and SmolLM2-360M (2024)). Time-pressure <b>detects</b> urgency but is detection-only.
   The politeness gauge was removed Oct 2026 after testing showed it tracked sentence
   shape, not politeness. Runs SmolLM2-360M-Instruct (360M, 2024, q4) fully on-device; nothing
-  you type leaves this page. Small open model — not a mind reader. Research instrument, v4.<br>Monitor Mode scores each generated token's hidden states live; generation is greedy decoding, short outputs.
+  you type leaves this page. Small open model — not a mind reader. Research instrument, v5.<br>Oct 2026: needle gauges replaced with live EKG traces — each trace shows a probe's recent readings, updating as you type and token-by-token in Monitor Mode. Tap a trace name to choose which probe colors the word heatmap. Monitor Mode scores each generated token's hidden states live; generation is greedy decoding, short outputs.
 </div>
 
 <script>
@@ -170,44 +178,160 @@ SAMPLES.forEach(s => {
   $('samples').appendChild(b);
 });
 
-/* ---- gauges ---- */
-const NS = 'http://www.w3.org/2000/svg';
-function arcPath(cx, cy, r, a0, a1) {
-  const p = a => [cx + r * Math.cos(a), cy - r * Math.sin(a)];
-  const [x0, y0] = p(a0), [x1, y1] = p(a1);
-  return `M ${x0} ${y0} A ${r} ${r} 0 ${(a1 - a0) > Math.PI ? 1 : 0} 1 ${x1} ${y1}`;
+/* ---- live traces (EKG-style; replaces the old needle gauges) ---- */
+const TRACE_N = 50;
+const TRACES = { valence: [], formality: [], pressure: [] };
+const TRACE_COLORS = { valence: '#58c98b', formality: '#5aa9e0', pressure: '#e0b45a' };
+let heatProbe = 'valence';
+let heatTokens = []; // [{text, scores}] — monitor-mode word heatmap
+
+function hexA(hex, a) {
+  const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + a.toFixed(2) + ')';
 }
-function gaugeSVG(score, range, goodIsPos) {
-  const cx = 75, cy = 70, r = 55;
-  const t = Math.max(-1, Math.min(1, score / range));
-  const a = Math.PI * (1 - (t + 1) / 2);
-  const [nx, ny] = [cx + (r - 13) * Math.cos(a), cy - (r - 13) * Math.sin(a)];
-  const col = goodIsPos === null ? '#8fa0b3' : ((score > 0) === goodIsPos ? '#58c98b' : '#ff5a5a');
-  return `<svg viewBox="0 0 150 85">` +
-    `<path d="${arcPath(cx, cy, r, Math.PI, 0)}" stroke="#1d2632" stroke-width="10" fill="none" stroke-linecap="round"/>` +
-    `<path d="${arcPath(cx, cy, r, Math.PI, a)}" stroke="${col}" stroke-width="10" fill="none" stroke-linecap="round"/>` +
-    `<circle cx="${nx.toFixed(1)}" cy="${ny.toFixed(1)}" r="5" fill="${col}"/>` +
-    `</svg>`;
-}
-function renderPanel(scores, ms) {
+
+function buildTraces() {
   const panel = document.getElementById('panel');
   panel.innerHTML = '';
   for (const key of ORDER) {
     const P = PROBES[key];
+    const strip = document.createElement('div');
+    strip.className = 'strip' + (key === heatProbe ? ' active' : '');
+    strip.dataset.probe = key;
+    strip.innerHTML =
+      '<div class="strip-head" data-probe="' + key + '">' +
+        '<span class="strip-title">' + P.title + '</span>' +
+        '<span class="badge ' + (P.status === 'validated' ? 'ok' : P.status === 'detection-only' ? 'det' : 'exp') + '">' + P.status + '</span>' +
+        '<span class="strip-verdict"></span>' +
+        '<span class="strip-score">—</span>' +
+      '</div>' +
+      '<canvas class="trace"></canvas>';
+    panel.appendChild(strip);
+  }
+  panel.querySelectorAll('.strip-head').forEach(h => {
+    h.addEventListener('click', () => {
+      heatProbe = h.dataset.probe;
+      markActiveProbe();
+      renderHeatmap();
+    });
+  });
+}
+
+function markActiveProbe() {
+  document.querySelectorAll('.strip').forEach(s => {
+    s.classList.toggle('active', s.dataset.probe === heatProbe);
+  });
+}
+
+function sizeCanvases() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  document.querySelectorAll('canvas.trace').forEach(c => {
+    const w = c.clientWidth || 300;
+    c.width = Math.max(1, Math.round(w * dpr));
+    c.height = Math.round(64 * dpr);
+  });
+  drawAllTraces();
+}
+
+function drawTrace(key) {
+  const strip = document.querySelector('.strip[data-probe="' + key + '"]');
+  if (!strip) return;
+  const c = strip.querySelector('canvas');
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
+  const data = TRACES[key];
+  ctx.fillStyle = '#0a0e13';
+  ctx.fillRect(0, 0, W, H);
+  let maxAbs = 60;
+  for (let i = 0; i < data.length; i++) { const a = Math.abs(data[i]); if (a > maxAbs) maxAbs = a; }
+  const midY = H / 2, amp = H * 0.42;
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(130,150,170,0.14)';
+  ctx.beginPath();
+  for (const f of [-0.5, 0.5]) {
+    const y = Math.round(midY + f * amp);
+    ctx.moveTo(0, y); ctx.lineTo(W, y);
+  }
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(130,150,170,0.32)';
+  ctx.beginPath(); ctx.moveTo(0, Math.round(midY)); ctx.lineTo(W, Math.round(midY)); ctx.stroke();
+  if (data.length < 2) return;
+  const n = data.length;
+  const x = i => W - ((n - 1 - i) / (TRACE_N - 1)) * W;
+  const y = v => midY - (v / maxAbs) * amp;
+  const color = TRACE_COLORS[key];
+  const lw = Math.max(1.5, H / 36);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.strokeStyle = hexA(color, 0.22); // cheap glow pass
+  ctx.lineWidth = lw * 3;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) { if (i === 0) ctx.moveTo(x(i), y(data[i])); else ctx.lineTo(x(i), y(data[i])); }
+  ctx.stroke();
+  ctx.strokeStyle = color; // crisp pass
+  ctx.lineWidth = lw;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) { if (i === 0) ctx.moveTo(x(i), y(data[i])); else ctx.lineTo(x(i), y(data[i])); }
+  ctx.stroke();
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(x(n - 1), y(data[n - 1]), lw * 1.4, 0, 6.2832);
+  ctx.fill();
+}
+
+function drawAllTraces() { for (const key of ORDER) drawTrace(key); }
+
+function pushTrace(scores) {
+  for (const key of ORDER) {
+    const a = TRACES[key];
+    a.push(scores[key]);
+    if (a.length > TRACE_N) a.shift();
+  }
+  drawAllTraces();
+}
+
+function updateReadouts(scores) {
+  for (const key of ORDER) {
+    const P = PROBES[key];
     const s = scores[key];
     const pos = s > P.threshold;
-    const card = document.createElement('div');
-    card.className = 'vital';
-    card.innerHTML =
-      `<h3>${P.title}<span class="badge ${P.status === 'validated' ? 'ok' : P.status === 'detection-only' ? 'det' : 'exp'}">${P.status}</span></h3>` +
-      gaugeSVG(s - P.threshold, 300, P.good === 'pos' ? true : P.good === 'neg' ? false : null) +
-      `<div class="verdict ${P.good === null ? '' : ((pos === (P.good === 'pos')) ? 'good' : 'bad')}">${pos ? P.pos : P.neg}</div>` +
-      `<div class="score">${s >= 0 ? '+' : ''}${s.toFixed(1)}</div>`;
-    panel.appendChild(card);
+    const strip = document.querySelector('.strip[data-probe="' + key + '"]');
+    if (!strip) continue;
+    const vEl = strip.querySelector('.strip-verdict');
+    const scEl = strip.querySelector('.strip-score');
+    vEl.textContent = pos ? P.pos : P.neg;
+    vEl.className = 'strip-verdict ' + (P.good === null ? '' : ((pos === (P.good === 'pos')) ? 'good' : 'bad'));
+    scEl.textContent = (s >= 0 ? '+' : '') + s.toFixed(1);
   }
-  document.getElementById('scantime').textContent = ms + ' ms on-device · 3 vital signs';
-  document.getElementById('result').style.display = 'block';
 }
+
+function renderHeatmap() {
+  const box = document.getElementById('heatmap');
+  if (!heatTokens.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  const P = PROBES[heatProbe];
+  let html = '<div class="heat-label">Word colors: ' + P.title.toLowerCase() +
+    ' <span class="heat-hint">(tap a trace name to switch)</span></div><div class="heat-words">';
+  for (const t of heatTokens) {
+    const s = t.scores[heatProbe];
+    const inten = Math.min(1, Math.abs(s) / 300);
+    const col = s >= 0 ? TRACE_COLORS[heatProbe] : '#ff5a5a';
+    const safe = t.text.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    html += '<span class="heat-word" style="background:' + hexA(col, 0.10 + 0.55 * inten) +
+      '" title="' + P.title + ': ' + (s >= 0 ? '+' : '') + s.toFixed(1) + '">' + safe + '</span>';
+  }
+  box.innerHTML = html + '</div>';
+  box.style.display = 'block';
+}
+
+function renderPanel(scores, ms) {
+  const res = document.getElementById('result');
+  if (res.style.display !== 'block') { res.style.display = 'block'; sizeCanvases(); }
+  updateReadouts(scores);
+  pushTrace(scores);
+  document.getElementById('scantime').textContent = ms + ' ms on-device · 3 vital signs';
+}
+
+buildTraces();
+window.addEventListener('resize', sizeCanvases);
 
 /* ---- model + probe ---- */
 let session = null, tokenizer = null;
@@ -298,6 +422,7 @@ async function runProbeScan() {
   const prompt = $('prompt').value.trim();
   if (!prompt || !session || scanning || prompt.length < 8) return;
   scanning = true;
+  heatTokens = []; renderHeatmap(); // stale generation heatmap cleared on new scan
   scanBtn.disabled = true; scanBtn.textContent = 'Scanning…';
   status.textContent = 'Reading hidden states…';
   try {
@@ -333,6 +458,7 @@ async function runMonitor(prompt) {
   const genout = $('genout'), stopBtn = $('stopgen');
   genout.style.display = 'block'; genout.innerHTML = '';
   stopBtn.style.display = 'block';
+  heatTokens = []; renderHeatmap();
   let slowWarned = false;
   try {
     // 1) score the prompt itself first (existing behavior)
@@ -380,7 +506,11 @@ async function runMonitor(prompt) {
         const hd = out['hidden_states.' + L].data, base = (n - 1) * 960;
         for (let j = 0; j < 960; j++) vec[j] += hd[base + j] / 32;
       }
-      renderPanel(scoreVec(vec), Math.round(stepMs));
+      const sc = scoreVec(vec);
+      heatTokens.push({ text: tokenizer.decode([best], { skip_special_tokens: true }), scores: sc });
+      if (heatTokens.length > MAX_GEN_TOKENS) heatTokens.shift();
+      renderPanel(sc, Math.round(stepMs));
+      renderHeatmap();
 
       // stream text
       const fullText = tokenizer.decode(ids, { skip_special_tokens: true });
