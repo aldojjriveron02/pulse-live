@@ -484,6 +484,7 @@ async function runMonitor(prompt) {
         attention_mask: new ort.Tensor('int64', new BigInt64Array(n).fill(1n), [1, n]),
         position_ids: new ort.Tensor('int64', gpos, [1, n]),
       });
+      if (monitorStop) break; // stop pressed mid-step: exit before processing this step's token
       const stepMs = performance.now() - s0;
       if (stepMs > 2000 && !slowWarned) {
         slowWarned = true;
@@ -529,10 +530,14 @@ async function runMonitor(prompt) {
     status.textContent = monitorStop ? 'Stopped — ' + genCount + ' tokens.' : 'Done — ' + genCount + ' tokens.';
   } catch (e) {
     status.textContent = 'Monitor failed: ' + (e.message || e).toString().slice(0, 160);
+  } finally {
+    // every exit path (done, EOS, cap, repetition guard, Stop, exception)
+    // must release the scan lock or the Scan button dies
+    scanning = false;
+    monitoring = false;
+    stopBtn.style.display = 'none';
+    scanBtn.disabled = false; scanBtn.textContent = 'Scan';
   }
-  monitoring = false;
-  stopBtn.style.display = 'none';
-  scanBtn.disabled = false; scanBtn.textContent = 'Scan';
 }
 
 // Live mode: re-scan ~900ms after the user stops typing
