@@ -47,6 +47,9 @@
 
 <textarea id="prompt" placeholder="Type something… e.g. My exam starts in five minutes. Explain how rain forms."></textarea>
 <button id="scan" disabled>Loading model…</button>
+<label id="liveToggle" style="display:flex;align-items:center;justify-content:center;gap:8px;margin-top:10px;font-size:14px;color:#8fa0b3;cursor:pointer;user-select:none;">
+  <input type="checkbox" id="liveMode" checked style="width:18px;height:18px;accent-color:#ff5a5a;"> Live gauges
+</label>
 <div class="bar" id="loadbar"><div></div></div>
 
 <div class="samples" id="samples"></div>
@@ -269,9 +272,11 @@ async function probe(prompt) {
   return scores;
 }
 
-scanBtn.onclick = async () => {
+let scanning = false;
+async function runScan() {
   const prompt = $('prompt').value.trim();
-  if (!prompt || !session) return;
+  if (!prompt || !session || scanning || prompt.length < 8) return;
+  scanning = true;
   scanBtn.disabled = true; scanBtn.textContent = 'Scanning…';
   status.textContent = 'Reading hidden states…';
   try {
@@ -283,8 +288,18 @@ scanBtn.onclick = async () => {
   } catch (e) {
     status.textContent = 'Scan failed: ' + (e.message || e).toString().slice(0, 160);
   }
+  scanning = false;
   scanBtn.disabled = false; scanBtn.textContent = 'Scan';
-};
+}
+scanBtn.onclick = runScan;
+
+// Live mode: re-scan ~900ms after the user stops typing
+let liveTimer = null;
+$('prompt').addEventListener('input', () => {
+  if (!$('liveMode').checked || !session) return;
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(runScan, 900);
+});
 
 init();
 </script>
