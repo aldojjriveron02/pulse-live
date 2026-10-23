@@ -34,6 +34,17 @@
   .vital .verdict.good { color: #58c98b; } .vital .verdict.bad { color: #ff5a5a; }
   .vital .score { font-size: 11px; color: #8fa0b3; font-variant-numeric: tabular-nums; }
   #scantime { font-size: 12px; color: #8fa0b3; margin-top: 10px; text-align: center; }
+  .toggles { display: flex; align-items: center; justify-content: center; gap: 18px; margin-top: 10px; }
+  .toggles label { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #8fa0b3;
+                   cursor: pointer; user-select: none; }
+  .toggles input[type=checkbox] { width: 18px; height: 18px; accent-color: #ff5a5a; }
+  #genout { display: none; margin-top: 12px; background: #0f151d; border: 1px solid #232f3d;
+            border-radius: 12px; padding: 12px; font-size: 15px; line-height: 1.55; color: #e8eef4;
+            white-space: pre-wrap; min-height: 60px; }
+  #genout .cursor { display: inline-block; width: 8px; animation: blink 1s infinite; color: #ff5a5a; }
+  @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
+  button#stopgen { display: none; width: 100%; margin-top: 10px; padding: 12px; font-size: 16px; font-weight: 700;
+                   border: 0; border-radius: 12px; background: #3a4552; color: #fff; cursor: pointer; }
   .label { margin-top: 22px; font-size: 12px; color: #6b7b8f; line-height: 1.55;
            border-top: 1px solid #1d2632; padding-top: 14px; }
   .bar { height: 6px; background: #1d2632; border-radius: 3px; overflow: hidden; margin-top: 8px; display:none; }
@@ -47,9 +58,10 @@
 
 <textarea id="prompt" placeholder="Type something… e.g. My exam starts in five minutes. Explain how rain forms."></textarea>
 <button id="scan" disabled>Loading model…</button>
-<label id="liveToggle" style="display:flex;align-items:center;justify-content:center;gap:8px;margin-top:10px;font-size:14px;color:#8fa0b3;cursor:pointer;user-select:none;">
-  <input type="checkbox" id="liveMode" checked style="width:18px;height:18px;accent-color:#ff5a5a;"> Live gauges
-</label>
+<div class="toggles">
+  <label><input type="checkbox" id="liveMode" checked> Live gauges</label>
+  <label title="Generate a completion and watch the gauges track the AI token by token"><input type="checkbox" id="monitorMode"> Monitor mode</label>
+</div>
 <div class="bar" id="loadbar"><div></div></div>
 
 <div class="samples" id="samples"></div>
@@ -58,6 +70,8 @@
 <div id="result">
   <div id="panel"></div>
   <div id="scantime"></div>
+  <div id="genout"></div>
+  <button id="stopgen">⏹ Stop</button>
 </div>
 
 <div class="label">
@@ -68,7 +82,7 @@
   and SmolLM2 2024). Time-pressure <b>detects</b> urgency but is detection-only.
   The politeness gauge was removed Oct 2026 after testing showed it tracked sentence
   shape, not politeness. Runs SmolLM2 (135M, 2024, int8) fully on-device; nothing
-  you type leaves this page. Small open model — not a mind reader. Research instrument, v3.
+  you type leaves this page. Small open model — not a mind reader. Research instrument, v3.<br>Monitor Mode scores each generated token's hidden states live; generation is greedy decoding, short outputs.
 </div>
 
 <script>
@@ -262,6 +276,10 @@ async function probe(prompt) {
       vec[j] += s / seq / 30;
     }
   }
+  return scoreVec(vec);
+}
+
+function scoreVec(vec) {
   const scores = {};
   for (const key of ORDER) {
     const P = PROBES[key];
@@ -276,6 +294,7 @@ let scanning = false;
 async function runScan() {
   const prompt = $('prompt').value.trim();
   if (!prompt || !session || scanning || prompt.length < 8) return;
+  if ($('monitorMode').checked) { await runMonitor(prompt); return; }
   scanning = true;
   scanBtn.disabled = true; scanBtn.textContent = 'Scanning…';
   status.textContent = 'Reading hidden states…';
@@ -292,6 +311,86 @@ async function runScan() {
   scanBtn.disabled = false; scanBtn.textContent = 'Scan';
 }
 scanBtn.onclick = runScan;
+
+/* ---- Monitor Mode: generate + score every token live ---- */
+let monitorStop = false, monitoring = false;
+const MAX_GEN_TOKENS = 40;
+$('stopgen').onclick = () => { monitorStop = true; };
+
+async function runMonitor(prompt) {
+  monitoring = true; monitorStop = false;
+  scanBtn.disabled = true; scanBtn.textContent = 'Generating…';
+  const genout = $('genout'), stopBtn = $('stopgen');
+  genout.style.display = 'block'; genout.innerHTML = '';
+  stopBtn.style.display = 'block';
+  let slowWarned = false;
+  try {
+    // 1) score the prompt itself first (existing behavior)
+    status.textContent = 'Scoring your prompt…';
+    const t0 = performance.now();
+    renderPanel(await probe(prompt), Math.round(performance.now() - t0));
+
+    // 2) set up generation
+    const enc = await tokenizer(prompt);
+    let ids = Array.from(enc.input_ids.data, Number);
+    const promptDecoded = tokenizer.decode(ids, { skip_special_tokens: true });
+    const eosId = (tokenizer.eos_token_id != null) ? tokenizer.eos_token_id : 0;
+    let repeatCount = 0, lastTok = -1, genCount = 0;
+
+    for (let step = 0; step < MAX_GEN_TOKENS && !monitorStop; step++) {
+      const n = ids.length;
+      status.textContent = 'Generating… token ' + (step + 1) + '/' + MAX_GEN_TOKENS;
+      const s0 = performance.now();
+      const out = await session.run({
+        input_ids: new ort.Tensor('int64', BigInt64Array.from(ids.map(BigInt)), [1, n]),
+        attention_mask: new ort.Tensor('int64', new BigInt64Array(n).fill(1n), [1, n]),
+      });
+      const stepMs = performance.now() - s0;
+      if (stepMs > 2000 && !slowWarned) {
+        slowWarned = true;
+        status.textContent += ' (slow device — continuing…)';
+      }
+
+      // greedy next token from last-position logits
+      const lg = out['logits'], d = lg.data, vocab = lg.dims[2], off = (n - 1) * vocab;
+      let best = 0, bestV = -Infinity;
+      for (let v = 0; v < vocab; v++) { const val = d[off + v]; if (val > bestV) { bestV = val; best = v; } }
+      if (best === eosId) break;
+      repeatCount = (best === lastTok) ? repeatCount + 1 : 0;
+      lastTok = best;
+      if (repeatCount >= 4) break; // repetition guard
+      ids.push(best); genCount++;
+
+      // score THIS token's hidden states (mean over 30 layers, last position)
+      const vec = new Float64Array(576);
+      for (let L = 0; L < 30; L++) {
+        const hd = out['hidden_states.' + L].data, base = (n - 1) * 576;
+        for (let j = 0; j < 576; j++) vec[j] += hd[base + j] / 30;
+      }
+      renderPanel(scoreVec(vec), Math.round(stepMs));
+
+      // stream text
+      const fullText = tokenizer.decode(ids, { skip_special_tokens: true });
+      const shown = fullText.slice(promptDecoded.length);
+      genout.innerHTML = '';
+      genout.appendChild(document.createTextNode(shown));
+      const cur = document.createElement('span');
+      cur.className = 'cursor'; cur.textContent = '▍';
+      genout.appendChild(cur);
+
+      await new Promise(r => setTimeout(r, 0)); // yield to UI
+    }
+    // final: remove cursor, keep text
+    const finalText = tokenizer.decode(ids, { skip_special_tokens: true }).slice(promptDecoded.length);
+    genout.textContent = finalText;
+    status.textContent = monitorStop ? 'Stopped — ' + genCount + ' tokens.' : 'Done — ' + genCount + ' tokens.';
+  } catch (e) {
+    status.textContent = 'Monitor failed: ' + (e.message || e).toString().slice(0, 160);
+  }
+  monitoring = false;
+  stopBtn.style.display = 'none';
+  scanBtn.disabled = false; scanBtn.textContent = 'Scan';
+}
 
 // Live mode: re-scan ~900ms after the user stops typing
 let liveTimer = null;
