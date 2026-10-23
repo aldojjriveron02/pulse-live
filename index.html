@@ -291,10 +291,9 @@ function scoreVec(vec) {
 }
 
 let scanning = false;
-async function runScan() {
+async function runProbeScan() {
   const prompt = $('prompt').value.trim();
   if (!prompt || !session || scanning || prompt.length < 8) return;
-  if ($('monitorMode').checked) { await runMonitor(prompt); return; }
   scanning = true;
   scanBtn.disabled = true; scanBtn.textContent = 'Scanning…';
   status.textContent = 'Reading hidden states…';
@@ -310,6 +309,12 @@ async function runScan() {
   scanning = false;
   scanBtn.disabled = false; scanBtn.textContent = 'Scan';
 }
+async function runScan() {
+  const prompt = $('prompt').value.trim();
+  if (!prompt || !session || scanning || prompt.length < 8) return;
+  if ($('monitorMode').checked) { await runMonitor(prompt); return; }
+  await runProbeScan();
+}
 scanBtn.onclick = runScan;
 
 /* ---- Monitor Mode: generate + score every token live ---- */
@@ -318,6 +323,8 @@ const MAX_GEN_TOKENS = 40;
 $('stopgen').onclick = () => { monitorStop = true; };
 
 async function runMonitor(prompt) {
+  if (scanning) return;
+  scanning = true;
   monitoring = true; monitorStop = false;
   scanBtn.disabled = true; scanBtn.textContent = 'Generating…';
   const genout = $('genout'), stopBtn = $('stopgen');
@@ -397,7 +404,7 @@ let liveTimer = null;
 $('prompt').addEventListener('input', () => {
   if (!$('liveMode').checked || !session) return;
   clearTimeout(liveTimer);
-  liveTimer = setTimeout(runScan, 900);
+  liveTimer = setTimeout(runProbeScan, 900); // live typing scores only — never generates
 });
 
 init();
